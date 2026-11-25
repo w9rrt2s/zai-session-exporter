@@ -1,22 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-zai-session-exporter — Comprehensive chat.z.ai session exporter to JSONL.
+zai-session-exporter — Comprehensive chat.z.ai session exporter.
 
-Exports EVERY session linked to a chat.z.ai identity into clean, readable,
-precise JSONL files, capturing literally every action in each session:
+Exports EVERY session linked to a chat.z.ai identity into precise, readable
+files, capturing literally every action in each session:
 
   * user inputs (text + attached files)
   * the model's thinking / reasoning before each reply
   * the model's final replies
   * every tool call and tool result (verbatim arguments and payloads)
   * token usage, model names, timestamps, branch (parent/child) structure
-  * `raw_original` on every line: the verbatim API message (parsed JSON, key order preserved)
+  * `raw_original` on every JSONL line: the verbatim API message (parsed JSON,
+    key order preserved)
 
-Output layout (both organizations at once):
-  <output>/sessions/NNN_<title>_<id>.jsonl   one file per session
+Three output formats (--format):
+  jsonl  lossless, one JSON line per action (default)
+  md     clean readable Markdown per session
+  html   self-contained offline viewer per session (search, collapsible
+         thinking, styled tool calls, RTL-safe)
+
+Output layout:
+  <output>/sessions/NNN_<title>_<id>.<ext>   one file per session
   <output>/index.jsonl                       one summary line per session
   <output>/merged_all.jsonl                  every line of every session
+                                             (jsonl format only)
+  <output>/export_summary.json               machine-readable run summary
 
 API contract (reverse-engineered, stable since 2025):
   GET  /api/v1/auths/                      -> current identity (or NEW guest if unauthenticated)
@@ -25,16 +34,20 @@ API contract (reverse-engineered, stable since 2025):
   POST /api/v1/chats/{id}/messages/batch   -> {"ids": [...]} => {"data": {id: message}}
 
 Zero third-party dependencies (Python 3.8+ stdlib only).
+pip-installable: `pip install .` exposes the `zai-exporter` command and lets
+other tools `import zai_exporter`.
 
 MIT License. See LICENSE.
 """
 
 import argparse
+import html
 import json
 import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -45,7 +58,7 @@ except ImportError:  # pragma: no cover
     sys.stderr.write("Python 3 with urllib is required.\n")
     raise
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 DEFAULT_BASE_URL = "https://chat.z.ai"
 SCHEMA_VERSION = 1
 
@@ -74,6 +87,35 @@ def eprint(*args):
     print(*args, file=sys.stderr, flush=True)
 
 
+def force_utf8_stdio():
+    """Integration fix: on Windows, redirected stdout/stderr default to legacy
+    codecs (cp1252, cp936, ...). Any Arabic or em-dash in a session title would
+    then crash a long export at the first print. Force UTF-8 with replacement
+    so output can never kill a run."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            enc = (getattr(stream, "encoding", "") or "").lower().replace("-", "")
+            if stream is not None and hasattr(stream, "reconfigure") and enc not in ("utf8", "utf"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+def dump_line(prefix, raw_json=None):
+    """Serialize one JSONL line.
+
+    Performance fix: `raw_original` (the often-huge API message) used to be
+    re-encoded once per emitted event; a message with k blocks cost k full
+    encodes of the same object. When `raw_json` — a pre-encoded raw_original
+    JSON string — is given, it is spliced in verbatim: byte-identical output,
+    exactly one serialization per message instead of one per event.
+    """
+    if raw_json is None:
+        return json.dumps(prefix, ensure_ascii=False)
+    slim = {k: v for k, v in prefix.items() if k != "raw_original"}
+    return json.dumps(slim, ensure_ascii=False)[:-1] + ', "raw_original": ' + raw_json + "}"
+
+
 # ---------------------------------------------------------------------------
 # HTTP client
 # ---------------------------------------------------------------------------
@@ -86,7 +128,12 @@ class ApiError(Exception):
 
 
 class ZaiClient:
-    """Minimal authenticated client for the chat.z.ai web API."""
+    """Minimal authenticated client for the chat.z.ai web API.
+
+    urllib is used (not raw http.client) so system/company proxies from the
+    http_proxy / https_proxy environment variables keep working. The trade-off
+    is no connection pooling — see README "Performance notes".
+    """
 
     def __init__(self, base_url, token=None, retries=3, timeout=60):
         self.base_url = base_url.rstrip("/")
@@ -162,7 +209,7 @@ class ZaiClient:
         messages, problems = {}, []
         complete = True
         ids = [str(i) for i in ids if i is not None]
-        chunks = [ids[i:i + batch_size] for i in range(0, len(ids), batch_size)] or []
+        chunks = [ids[i:i + batch_size] for i in range(0, len(ids), batch_size)]
         for ci, chunk in enumerate(chunks, 1):
             if progress_cb:
                 progress_cb(ci, len(chunks))
@@ -232,8 +279,13 @@ def connect(client, args):
 # ---------------------------------------------------------------------------
 
 def list_all_chats(client, chat_type, quiet=False):
-    """Walk all pages of GET /chats/ and return summaries in API order."""
+    """Walk all pages of GET /chats/ and return summaries in API order.
+
+    Duplicate session ids (a server pagination bug would otherwise export the
+    same session twice under two ordinals) are de-duplicated with a warning.
+    """
     summaries, page = [], 1
+    seen_ids = set()
     while True:
         data = client.list_chats_page(page, chat_type)
         if isinstance(data, dict):  # tolerate {"chats": [...]} wrappers
@@ -248,7 +300,14 @@ def list_all_chats(client, chat_type, quiet=False):
             raise ApiError("Unexpected chat-list payload on page %d: %s" % (page, type(data).__name__))
         if not data:
             break
-        summaries.extend(data)
+        for c in data:
+            cid = str(c.get("id"))
+            if cid in seen_ids:
+                if not quiet:
+                    eprint("  duplicate session id %s in listing skipped" % cid)
+                continue
+            seen_ids.add(cid)
+            summaries.append(c)
         if not quiet:
             eprint("  listed page %d (%d sessions so far)" % (page, len(summaries)))
         page += 1
@@ -258,8 +317,16 @@ def list_all_chats(client, chat_type, quiet=False):
 
 
 def apply_scope(summaries, args):
-    """Apply --from/--to/--last filters on updated_at (API order is newest-first)."""
+    """Apply --search/--from/--to/--last filters (API order is newest-first).
+
+    Filter order matters: search and dates narrow the pool, and only then does
+    --last N take the N most recent *matching* sessions.
+    """
     out = summaries
+    search = getattr(args, "search", None)
+    if search:
+        needle = search.lower()
+        out = [c for c in out if needle in str(c.get("title") or "").lower()]
     if args.from_date or args.to_date:
         def within(c):
             ts = iso_ts(c.get("updated_at") or c.get("created_at"))
@@ -286,6 +353,9 @@ TOOL_RESULT_TYPES = {"tool_result", "tool_response", "function_call_output"}
 THINKING_TYPES = {"reasoning", "thinking", "thought", "reflection", "plan"}
 MEDIA_TYPES = {"image", "image_url", "file", "audio", "video"}
 META_TYPES = {"system", "error", "metadata"}
+
+EVENT_TYPES = ("user_input", "attachment", "thinking", "model_reply",
+               "tool_call", "tool_result", "other", "missing_message")
 
 
 def block_text(block):
@@ -595,18 +665,293 @@ def readable_order(messages_by_id):
         walk(r)
     for mid in ids:            # anything unreachable (broken links) keeps canonical order
         walk(mid)
-    return ordered, len(ids) - len(set(parent_of.values()))  # ordered, root count
+    # Correctness fix (v1.2.0): the old formula len(ids) - len(set(parent_of.values()))
+    # returned the number of LEAVES, not roots (wrong whenever a parent has 2+
+    # children). Roots = nodes with no parent in the map.
+    root_count = sum(1 for mid in ids if mid not in parent_of)
+    return ordered, root_count
+
+
+# ---------------------------------------------------------------------------
+# Markdown + HTML renderers (--format md / --format html)
+# ---------------------------------------------------------------------------
+
+_FENCE_RUN = re.compile(r"`{3,}")
+
+
+def _md_fence(text):
+    """A code fence guaranteed not to collide with backticks inside `text`."""
+    n = 3
+    for run in _FENCE_RUN.findall(text or ""):
+        n = max(n, len(run) + 1)
+    return "`" * n
+
+
+def _md_meta(ev):
+    bits = []
+    if ev.get("model"):
+        bits.append(str(ev["model"]))
+    if ev.get("timestamp"):
+        bits.append(str(ev["timestamp"]))
+    return " · ".join(bits)
+
+
+def md_session_header(s):
+    lines = [
+        "# " + str(s.get("title") or "Untitled"),
+        "",
+        "- Session ID: `%s`" % s.get("session_id"),
+        "- Chat type: %s" % s.get("chat_type"),
+        "- Created: %s" % (s.get("created_at") or "?"),
+        "- Updated: %s" % (s.get("updated_at") or "?"),
+        "- Messages advertised: %s" % s.get("message_count"),
+        "- Export complete: %s" % ("yes" if s.get("export_complete") else "NO — some payloads missing"),
+        "- Exported by: %s" % s.get("tool"),
+    ]
+    if s.get("problems"):
+        lines.append("- Problems: " + "; ".join(str(p) for p in s["problems"]))
+    lines += ["", "---", ""]
+    return "\n".join(lines)
+
+
+def md_event(ev):
+    etype = ev.get("event")
+    head = "### [%s] %s" % (ev.get("display_seq"), etype)
+    if ev.get("role"):
+        head += " — %s" % ev["role"]
+    out = [head]
+    meta = _md_meta(ev)
+    if meta:
+        out += ["", "*%s*" % meta]
+    out.append("")
+
+    tool = ev.get("tool") if isinstance(ev.get("tool"), dict) else None
+
+    if etype == "attachment":
+        f = ev.get("files") if isinstance(ev.get("files"), dict) else None
+        if f:
+            name = f.get("name") or f.get("filename") or "file"
+            size = f.get("size")
+            out.append("- File: **%s**%s" % (name, " (%s bytes)" % size if size else ""))
+        else:
+            out.append("- Media attachment")
+        out.append("")
+    elif etype == "missing_message":
+        out.append("_(message payload missing on the server — exported as a placeholder "
+                   "so nothing silently disappears)_")
+        out.append("")
+    elif etype == "tool_call":
+        label = (tool or {}).get("name") or "tool"
+        out.append("**%s**" % label)
+        out.append("")
+        args = (tool or {}).get("arguments")
+        body = None
+        if args is not None:
+            body = args if isinstance(args, str) else json.dumps(args, ensure_ascii=False, indent=2)
+        elif ev.get("text"):
+            body = ev["text"]
+        if body:
+            fence = _md_fence(body)
+            out += [fence, body, fence, ""]
+    elif etype == "tool_result":
+        label = (tool or {}).get("name") or "tool"
+        status = (tool or {}).get("status")
+        if status:
+            label += " (status: %s)" % status
+        out.append("**%s**" % label)
+        out.append("")
+        text = ev.get("text")
+        if text:
+            fence = _md_fence(text)
+            out += [fence, text, fence, ""]
+    elif etype == "thinking" and ev.get("text"):
+        out += ["> " + ln for ln in str(ev["text"]).splitlines()]
+        out.append("")
+    else:
+        text = ev.get("text")
+        if text:
+            out += [str(text), ""]
+        else:
+            out += ["_(no textual payload)_", ""]
+    return "\n".join(out) + "\n"
+
+
+def md_session_footer(end_line):
+    counts = end_line.get("event_counts") or {}
+    summary = ", ".join("%s=%d" % (k, v) for k, v in sorted(counts.items())) or "no events"
+    return "\n".join([
+        "---", "",
+        "*%d events (%s). Export complete: %s*" % (
+            end_line.get("event_count", 0), summary,
+            "yes" if end_line.get("export_complete") else "NO"),
+        "",
+    ])
+
+
+def _esc(v):
+    return html.escape(str(v)) if v is not None else ""
+
+
+def _html_card(ev):
+    etype = ev.get("event") or "other"
+    who = []
+    if ev.get("role"):
+        who.append(str(ev["role"]))
+    if ev.get("model"):
+        who.append(str(ev["model"]))
+    if ev.get("timestamp"):
+        who.append(str(ev["timestamp"]))
+    tag = '<span class="tag t-%s">%s</span>' % (_esc(etype), _esc(etype.replace("_", " ")))
+    seq = '<span class="seq">#%s</span>' % _esc(ev.get("display_seq"))
+    whos = '<span class="who">%s</span>' % _esc(" · ".join(who))
+    head = '<div class="hd">%s %s%s</div>' % (tag, seq, whos)
+
+    tool = ev.get("tool") if isinstance(ev.get("tool"), dict) else None
+    text = ev.get("text")
+    body = ""
+    if etype == "thinking" and text:
+        body = ('<details open><summary>Thinking</summary>'
+                '<div class="body" dir="auto">%s</div></details>' % _esc(text))
+    elif etype in ("tool_call", "tool_result"):
+        status = (tool or {}).get("status")
+        st = ""
+        if status:
+            cls = "status error" if status == "error" else "status"
+            st = '<span class="%s">%s</span>' % (cls, _esc(status))
+        label = '<span class="toolname">%s</span>%s' % (_esc((tool or {}).get("name") or "tool"), st)
+        inner = ""
+        if etype == "tool_call":
+            args = (tool or {}).get("arguments")
+            payload = None
+            if args is not None:
+                payload = args if isinstance(args, str) else json.dumps(args, ensure_ascii=False, indent=2)
+            if not payload and text:
+                payload = text
+            if payload:
+                inner = '<pre class="body" dir="auto">%s</pre>' % _esc(payload)
+        elif text:
+            inner = '<pre class="body" dir="auto">%s</pre>' % _esc(text)
+        body = '<details open class="tool"><summary>%s</summary>%s</details>' % (label, inner)
+    elif etype == "attachment":
+        f = ev.get("files") if isinstance(ev.get("files"), dict) else None
+        nm = (f or {}).get("name") or (f or {}).get("filename") or (text or "attachment")
+        size = (f or {}).get("size")
+        suffix = " · %s bytes" % size if size else ""
+        body = '<div class="body" dir="auto">File: <b>%s</b>%s</div>' % (_esc(nm), _esc(suffix))
+    elif etype == "missing_message":
+        body = ('<div class="body missing" dir="auto">message payload missing on the server — '
+                'placeholder exported so nothing silently disappears</div>')
+    elif text:
+        body = '<div class="body" dir="auto">%s</div>' % _esc(text)
+    else:
+        body = '<div class="body nopayload">(no textual payload)</div>'
+    return '<div class="ev" data-t="%s">%s%s</div>' % (_esc(etype), head, body)
+
+
+_HTML_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__ — zai session</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--ink:#1d2330;--mut:#68718a;--line:#e3e6ee}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans",sans-serif}
+header{background:var(--card);border-bottom:1px solid var(--line);padding:18px 22px;position:sticky;top:0;z-index:2}
+h1{margin:0 0 4px;font-size:19px}
+.meta{color:var(--mut);font-size:12.5px}
+.meta b{color:var(--ink)}
+#search{margin-top:10px;width:min(560px,100%);padding:8px 12px;border:1px solid var(--line);border-radius:8px;font:inherit}
+main{max-width:900px;margin:18px auto 60px;padding:0 14px}
+.ev{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 16px;margin:10px 0}
+.ev.hidden{display:none}
+.hd{line-height:1.9}
+.tag{display:inline-block;font-size:11px;font-weight:600;letter-spacing:.4px;text-transform:uppercase;border-radius:5px;padding:2px 8px;margin-right:8px;color:#fff}
+.t-user_input{background:#2563eb}.t-model_reply{background:#059669}.t-thinking{background:#7c3aed}
+.t-tool_call{background:#0f766e}.t-tool_result{background:#334155}.t-attachment{background:#b45309}
+.t-other{background:#64748b}.t-missing_message{background:#dc2626}
+.seq{color:var(--mut);font-size:12px}
+.who{font-size:12.5px;color:var(--mut);margin-left:8px}
+.body{margin-top:8px;white-space:pre-wrap;word-wrap:break-word;overflow-wrap:anywhere}
+pre.body{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#0f172a;color:#e2e8f0;border-radius:8px;padding:10px 12px;overflow:auto;margin:8px 0 0}
+details{margin-top:8px}
+summary{cursor:pointer;color:#7c3aed;font-size:13px;font-weight:600}
+details.tool summary{color:#0f766e}
+.toolname{font-weight:600;color:#0f766e}
+.status{font-size:11px;border-radius:4px;padding:1px 6px;margin-left:6px;background:#e2e8f0;color:#334155}
+.status.error{background:#fee2e2;color:#b91c1c}
+.missing{color:#b45309;font-style:italic}
+.nopayload{color:var(--mut);font-style:italic}
+footer{max-width:900px;margin:0 auto 40px;padding:0 14px;color:var(--mut);font-size:12.5px}
+</style>
+</head>
+<body>
+<header>
+<h1>__TITLE__</h1>
+<div class="meta">__META__</div>
+<input id="search" type="search" placeholder="Filter events by text..." aria-label="Filter events">
+</header>
+<main id="stream">
+__CARDS__
+</main>
+<footer>__FOOTER__</footer>
+<script>
+(function(){
+  var q=document.getElementById('search');
+  q.addEventListener('input',function(){var v=q.value.toLowerCase();
+    var list=document.querySelectorAll('.ev');
+    for(var i=0;i<list.length;i++){var el=list[i];
+      el.classList.toggle('hidden',!!v&&el.textContent.toLowerCase().indexOf(v)===-1);}
+  });
+})();
+</script>
+</body>
+</html>
+"""
+
+
+def _html_page(session_line, cards, end_line):
+    meta = [
+        "Session <b>%s</b>" % _esc(session_line.get("session_id")),
+        "type <b>%s</b>" % _esc(session_line.get("chat_type")),
+        "created <b>%s</b>" % _esc(session_line.get("created_at") or "?"),
+        "updated <b>%s</b>" % _esc(session_line.get("updated_at") or "?"),
+        "messages <b>%s</b>" % _esc(session_line.get("message_count")),
+    ]
+    ok = bool(session_line.get("export_complete"))
+    meta.append('complete <b style="color:%s">%s</b>' % ("#059669" if ok else "#dc2626",
+                                                         "yes" if ok else "NO - payloads missing"))
+    counts = end_line.get("event_counts") or {}
+    foot = ["zai-session-exporter", "%d events" % end_line.get("event_count", 0)]
+    foot += ["%s: %d" % (k, v) for k, v in sorted(counts.items())]
+    footer = _esc(" · ".join(foot))
+    if session_line.get("problems"):
+        footer += '<br>problems: %s' % _esc("; ".join(str(p) for p in session_line["problems"]))
+    return (_HTML_PAGE
+            .replace("__TITLE__", _esc(session_line.get("title") or "Untitled"))
+            .replace("__META__", " · ".join(meta))
+            .replace("__CARDS__", "\n".join(cards))
+            .replace("__FOOTER__", footer))
 
 
 # ---------------------------------------------------------------------------
 # Export pipeline
 # ---------------------------------------------------------------------------
 
-def export_session(client, summary, out_dir, ordinal, args, account_label):
-    """Fetch + convert one session. Returns (index_record, ok)."""
+def export_session(client, summary, out_dir, ordinal, args, account_label, merged_fh=None):
+    """Fetch + convert one session, streaming lines to disk as they are built.
+
+    Returns the index record. Raises ApiError on unrecoverable fetch failure.
+    When `merged_fh` is given (single-worker jsonl mode), every JSONL line is
+    written to BOTH the session file and the merged stream in the same pass —
+    no second read of the session file afterwards.
+    """
     chat_id = str(summary.get("id"))
     title = summary.get("title") or "Untitled"
-    fname = "%03d_%s_%s.jsonl" % (ordinal, safe_filename(title), chat_id[:8])
+    fmt = args.format
+    ext = "jsonl" if fmt == "jsonl" else ("md" if fmt == "md" else "html")
+    fname = "%03d_%s_%s.%s" % (ordinal, safe_filename(title), chat_id[:8], ext)
     path = out_dir / "sessions" / fname
 
     detail = client.get_chat_details(chat_id)
@@ -632,12 +977,8 @@ def export_session(client, summary, out_dir, ordinal, args, account_label):
     canon_pos = {mid: i + 1 for i, mid in enumerate(ids)}
     # Ids the server never returned are appended (canonical order) as
     # missing_message events, so nothing silently disappears from the export.
-    ordered_present = [mid for mid in order]
     missing_ids = [mid for mid in ids if mid not in messages_map]
-    display_ids = (ordered_present or [mid for mid in ids if mid in messages_map]) + missing_ids
-
-    # ---- build lines -------------------------------------------------------
-    lines = []
+    display_ids = (order or [mid for mid in ids if mid in messages_map]) + missing_ids
 
     created = iso_or_none(detail.get("created_at") or summary.get("created_at"))
     updated = iso_or_none(detail.get("updated_at") or summary.get("updated_at"))
@@ -656,54 +997,90 @@ def export_session(client, summary, out_dir, ordinal, args, account_label):
         "export_complete": complete,
         "problems": problems,
         "session_meta_raw": {k: v for k, v in summary.items() if k not in ("id", "title")},
-        "raw_original": detail,   # the full, untouched session detail response
     }
-    lines.append(session_line)
 
+    events_set = getattr(args, "events_set", None)
     counts = {}
     event_seq = 0
-    for display_i, mid in enumerate(display_ids, 1):
-        msg = messages_map.get(mid)
-        if msg is None:
-            evs = [{
-                "event": "missing_message", "role": None, "text": None,
-                "message_seq": canon_pos.get(mid), "message_id": mid,
-                "parent_id": None, "children_ids": None,
-                "timestamp": None, "timestamp_epoch": None,
-                "model": None, "usage": None, "files": None, "tool": None,
-                "raw_block": None, "raw_original": None,
-            }]
-        else:
-            evs = extract_events(msg, canon_pos.get(mid))
-        for ev in evs:
-            event_seq += 1
-            ev = {
-                "record_type": "event",
-                "schema_version": SCHEMA_VERSION,
-                "session_id": chat_id,
-                "event_seq": event_seq,
-                "display_seq": display_i,
-                **ev,
-            }
-            counts[ev["event"]] = counts.get(ev["event"], 0) + 1
-            lines.append(ev)
+    raw_cache = {}  # per-session: message id -> pre-serialized raw_original JSON
 
-    end_line = {
-        "record_type": "session_end",
-        "schema_version": SCHEMA_VERSION,
-        "session_id": chat_id,
-        "event_count": event_seq,
-        "event_counts": counts,
-        "export_complete": complete,
-        "problems": problems,
-    }
-    lines.append(end_line)
+    def raw_json_for(mid, raw):
+        """Encode `raw` exactly once per message (cache by message id)."""
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            return json.dumps(raw, ensure_ascii=False)
+        key = str(mid)
+        cached = raw_cache.get(key)
+        if cached is None:
+            cached = json.dumps(raw, ensure_ascii=False)
+            raw_cache[key] = cached
+        return cached
 
-    # ---- write -------------------------------------------------------------
     path.parent.mkdir(parents=True, exist_ok=True)
+    html_cards = None
     with path.open("w", encoding="utf-8") as fh:
-        for line in lines:
-            fh.write(json.dumps(line, ensure_ascii=False) + "\n")
+        def wjson(prefix, rj):
+            line = dump_line(prefix, rj) + "\n"
+            fh.write(line)
+            if merged_fh is not None:
+                merged_fh.write(line)
+
+        if fmt == "jsonl":
+            wjson(session_line, json.dumps(detail, ensure_ascii=False))
+        elif fmt == "md":
+            fh.write(md_session_header(session_line))
+        else:
+            html_cards = []
+
+        for display_i, mid in enumerate(display_ids, 1):
+            msg = messages_map.get(mid)
+            if msg is None:
+                evs = [{
+                    "event": "missing_message", "role": None, "text": None,
+                    "message_seq": canon_pos.get(mid), "message_id": mid,
+                    "parent_id": None, "children_ids": None,
+                    "timestamp": None, "timestamp_epoch": None,
+                    "model": None, "usage": None, "files": None, "tool": None,
+                    "raw_block": None, "raw_original": None,
+                }]
+            else:
+                evs = extract_events(msg, canon_pos.get(mid))
+            for ev in evs:
+                if events_set and ev["event"] not in events_set:
+                    continue
+                event_seq += 1
+                counts[ev["event"]] = counts.get(ev["event"], 0) + 1
+                prefix = {
+                    "record_type": "event",
+                    "schema_version": SCHEMA_VERSION,
+                    "session_id": chat_id,
+                    "event_seq": event_seq,
+                    "display_seq": display_i,
+                }
+                prefix.update({k: v for k, v in ev.items() if k != "raw_original"})
+                if fmt == "jsonl":
+                    wjson(prefix, raw_json_for(mid, ev.get("raw_original")))
+                elif fmt == "md":
+                    fh.write(md_event(prefix))
+                else:
+                    html_cards.append(_html_card(prefix))
+
+        end_line = {
+            "record_type": "session_end",
+            "schema_version": SCHEMA_VERSION,
+            "session_id": chat_id,
+            "event_count": event_seq,
+            "event_counts": counts,
+            "export_complete": complete,
+            "problems": problems,
+        }
+        if fmt == "jsonl":
+            wjson(end_line, None)
+        elif fmt == "md":
+            fh.write(md_session_footer(end_line))
+        else:
+            fh.write(_html_page(session_line, html_cards, end_line))
 
     index_record = {
         "record_type": "session_index",
@@ -719,8 +1096,10 @@ def export_session(client, summary, out_dir, ordinal, args, account_label):
         "problems": problems,
         "file": str(path.relative_to(out_dir)),
         "account": account_label,
+        "format": fmt,
+        "events": getattr(args, "events_tag", "all"),
     }
-    return index_record, complete
+    return index_record
 
 
 # ---------------------------------------------------------------------------
@@ -739,8 +1118,9 @@ def _valid_date(s):
 def parse_args(argv):
     p = argparse.ArgumentParser(
         prog="zai_exporter",
-        description="Export all chat.z.ai sessions to precise, readable JSONL "
-                    "(user inputs, model thinking, replies, tool calls — verbatim).")
+        description="Export all chat.z.ai sessions to precise, readable JSONL / "
+                    "Markdown / HTML (user inputs, model thinking, replies, tool "
+                    "calls — verbatim).")
     p.add_argument("--token", help="Bearer token from chat.z.ai (localStorage key 'token').")
     p.add_argument("--token-file", default="token.txt",
                    help="File containing the token (default: ./token.txt).")
@@ -749,7 +1129,15 @@ def parse_args(argv):
     p.add_argument("-o", "--output", default="zai_export", help="Output directory (default: ./zai_export).")
     p.add_argument("--base-url", default=DEFAULT_BASE_URL, help="API base (default: %s)." % DEFAULT_BASE_URL)
     p.add_argument("--chat-type", default="default", help="Chat list type filter (default: 'default'; try 'all').")
-    p.add_argument("--last", type=int, default=None, metavar="N", help="Only the N most recent sessions.")
+    p.add_argument("--format", choices=("jsonl", "md", "html"), default="jsonl",
+                   help="Session file format: jsonl (lossless, default), md (readable "
+                        "Markdown), html (offline interactive viewer).")
+    p.add_argument("--search", default=None, metavar="TEXT",
+                   help="Only sessions whose title contains TEXT (case-insensitive).")
+    p.add_argument("--events", default=None, metavar="T1,T2",
+                   help="Keep only these event types in the output, e.g. "
+                        "model_reply,thinking. Valid: %s. Default: all." % ",".join(EVENT_TYPES))
+    p.add_argument("--last", type=int, default=None, metavar="N", help="Only the N most recent matching sessions.")
     p.add_argument("--from", dest="from_date", default=None, metavar="YYYY-MM-DD", type=_valid_date,
                    help="Sessions updated on/after this date (UTC).")
     p.add_argument("--to", dest="to_date", default=None, metavar="YYYY-MM-DD", type=_valid_date,
@@ -757,18 +1145,52 @@ def parse_args(argv):
     p.add_argument("--session", action="append", default=[], metavar="ID", help="Export only these session ids (repeatable).")
     p.add_argument("--list", action="store_true", help="List sessions to stdout only; do not export.")
     p.add_argument("--resume", action="store_true",
-                   help="Skip sessions already exported cleanly with unchanged updated_at (reads previous index.jsonl).")
+                   help="Skip sessions already exported cleanly with unchanged updated_at "
+                        "in the SAME format and event filter (reads previous index.jsonl).")
+    p.add_argument("--workers", type=int, default=1, metavar="N",
+                   help="Fetch N sessions concurrently (default 1 = serial with polite --delay). "
+                        "Values > 1 disable the inter-session pause.")
     p.add_argument("--batch-size", type=int, default=50, help="Message ids per batch POST (default: 50).")
     p.add_argument("--retries", type=int, default=3, help="HTTP retries per request (default: 3).")
-    p.add_argument("--delay", type=float, default=0.4, help="Pause between sessions in seconds (default: 0.4).")
+    p.add_argument("--delay", type=float, default=0.4, help="Pause between sessions in seconds (default: 0.4; serial mode only).")
     p.add_argument("--timeout", type=int, default=60, help="HTTP timeout seconds (default: 60).")
-    p.add_argument("--no-merged", action="store_true", help="Skip merged_all.jsonl.")
+    p.add_argument("--no-merged", action="store_true", help="Skip merged_all.jsonl (jsonl format only).")
     p.add_argument("-q", "--quiet", action="store_true", help="Minimal progress output.")
     p.add_argument("-V", "--version", action="version", version="zai-session-exporter " + __version__)
-    return p.parse_args(argv)
+
+    args = p.parse_args(argv)
+    if args.workers < 1:
+        p.error("--workers must be >= 1")
+    if args.batch_size < 1:
+        p.error("--batch-size must be >= 1")
+    if args.retries < 1:
+        p.error("--retries must be >= 1")
+    if args.events:
+        wanted = [t.strip() for t in args.events.split(",") if t.strip()]
+        bad = [t for t in wanted if t not in EVENT_TYPES]
+        if bad or not wanted:
+            p.error("unknown or empty --events value(s): %s — valid types: %s"
+                    % (", ".join(bad) or "(empty)", ", ".join(EVENT_TYPES)))
+        args.events_set = frozenset(wanted)
+        args.events_tag = ",".join(sorted(wanted))
+    else:
+        args.events_set = None
+        args.events_tag = "all"
+    return args
+
+
+def _write_summary_file(out_dir, info):
+    """Machine-readable run summary (integration point for scripts/wrappers)."""
+    try:
+        (out_dir / "export_summary.json").write_text(
+            json.dumps(info, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        eprint("Run summary: %s" % (out_dir / "export_summary.json"))
+    except OSError as err:
+        eprint("WARNING: could not write export_summary.json: %s" % err)
 
 
 def main(argv=None):
+    force_utf8_stdio()
     args = parse_args(argv if argv is not None else sys.argv[1:])
     out_dir = Path(args.output).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -793,6 +1215,10 @@ def main(argv=None):
             account_label = "%s (role=%s)" % (ident.get("email") or ident.get("name") or ident.get("id"), ident.get("role", "?"))
     except ApiError as err:
         eprint("ERROR: authentication failed: %s" % err)
+        if getattr(err, "status", None) == 401:
+            eprint("The server rejected this token (HTTP 401) — it is probably expired, "
+                   "revoked, or was copied incompletely. Re-copy it: chat.z.ai -> F12 -> "
+                   "Application -> Local Storage -> key 'token'.")
         eprint("Get your token: open https://chat.z.ai -> F12 -> Application -> "
                "Local Storage -> copy the value of the 'token' key, then:\n"
                "  zai_exporter.py --token '<TOKEN>'   (or put it in token.txt)")
@@ -840,13 +1266,23 @@ def main(argv=None):
     eprint("Found %d session(s) in scope." % len(summaries))
     if args.list:
         for i, c in enumerate(summaries, 1):
-            print("  %3d. [%s] %s  (id=%s, updated=%s, %s msg(s))"
+            print("  %3d. [%s] %s  (id=%s, updated=%s)"
                   % (i, c.get("type", "?"), (c.get("title") or "Untitled")[:60],
-                     c.get("id"), iso_ts(c.get("updated_at")) or "?", c.get("message_count", "?")))
+                     c.get("id"), iso_ts(c.get("updated_at")) or "?"))
+        if not summaries:
+            print("  (no sessions in scope)")
         return 0
     if not summaries:
         eprint("Nothing to export. If this surprises you, read the token note above — "
                "a fresh guest identity has no history.")
+        _write_summary_file(out_dir, {
+            "tool": "zai-session-exporter", "version": __version__,
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "account": account_label, "base_url": args.base_url,
+            "format": args.format, "events": args.events_tag, "workers": args.workers,
+            "requested": 0, "exported_ok": 0, "incomplete": [],
+            "unavailable": unavailable, "output_dir": str(out_dir), "merged": False,
+        })
         return 0
 
     # ---- export ------------------------------------------------------------
@@ -855,7 +1291,15 @@ def main(argv=None):
     index_path = out_dir / "index.jsonl"
     merged_path = out_dir / "merged_all.jsonl"
 
+    # merged_all.jsonl is a JSONL stream of session files, so it only exists
+    # for --format jsonl. For md/html runs it is deliberately skipped.
+    merged_enabled = not args.no_merged and args.format == "jsonl"
+    if not args.no_merged and args.format != "jsonl":
+        eprint("NOTE: merged_all.jsonl is produced only with --format jsonl (current: %s)." % args.format)
+
     # --resume: remember cleanly exported sessions from a previous run.
+    # A previous record only counts when the format AND event filter match,
+    # otherwise switching --format would silently skip real work.
     prev_index = {}
     if args.resume and index_path.is_file():
         with index_path.open("r", encoding="utf-8") as fh:
@@ -868,17 +1312,60 @@ def main(argv=None):
                         and rec.get("export_complete") and rec.get("file"):
                     prev_index[str(rec.get("session_id"))] = rec
 
+    def resume_matches(rec, summary):
+        return (rec.get("format") == args.format
+                and rec.get("events") == args.events_tag
+                and rec.get("updated_at") == iso_or_none(summary.get("updated_at")))
+
     index_fh = index_path.open("w", encoding="utf-8")
-    merged_fh = None if args.no_merged else merged_path.open("w", encoding="utf-8")
+    merged_fh = merged_path.open("w", encoding="utf-8") if merged_enabled else None
 
     ok_count, incomplete = 0, []
+    started = time.time()
+
+    def absorb(idx_rec):
+        """Write an index record; in multi-worker mode also stream the finished
+        session file into merged (single-worker mode already dual-wrote it)."""
+        nonlocal ok_count
+        index_fh.write(json.dumps(idx_rec, ensure_ascii=False) + "\n")
+        index_fh.flush()
+        if args.workers > 1 and merged_fh is not None:
+            with (out_dir / idx_rec["file"]).open("r", encoding="utf-8") as sf:
+                for line in sf:
+                    merged_fh.write(line)
+            merged_fh.flush()
+        complete = idx_rec.get("export_complete")
+        status = "complete" if complete else "INCOMPLETE (missing message payloads — rerun later)"
+        eprint("    -> %s  [%s, %d events]" % (idx_rec["file"], status, idx_rec["event_count"]))
+        if complete:
+            ok_count += 1
+        else:
+            incomplete.append((idx_rec.get("session_id"), (idx_rec.get("title") or "")[:50],
+                               "missing message payloads"))
+
+    def record_failure(summary, err):
+        title = (summary.get("title") or "Untitled")[:50]
+        eprint("    FAILED: %s" % err)
+        incomplete.append((str(summary.get("id")), title, str(err)))
+        index_fh.write(json.dumps({
+            "record_type": "session_failed",
+            "session_id": summary.get("id"),
+            "title": title,
+            "account": account_label,
+            "format": args.format,
+            "error": str(err),
+        }, ensure_ascii=False) + "\n")
+        index_fh.flush()
+
+    rc = 0
     try:
+        # ---- passes: plan skipped (resume) vs to-fetch ----------------------
+        todo = []
         for i, summary in enumerate(summaries, 1):
-            title = (summary.get("title") or "Untitled")[:50]
-            eprint("[%d/%d] %s ..." % (i, len(summaries), title))
             prev = prev_index.get(str(summary.get("id")))
-            if prev and (out_dir / prev["file"]).is_file() and \
-                    prev.get("updated_at") == iso_or_none(summary.get("updated_at")):
+            if prev and (out_dir / prev["file"]).is_file() and resume_matches(prev, summary):
+                title = (prev.get("title") or "Untitled")[:50]
+                eprint("[%d/%d] %s ..." % (i, len(summaries), title))
                 eprint("    unchanged since last export — skipped (--resume)")
                 index_fh.write(json.dumps(prev, ensure_ascii=False) + "\n")
                 index_fh.flush()
@@ -888,56 +1375,69 @@ def main(argv=None):
                             merged_fh.write(line)
                     merged_fh.flush()
                 ok_count += 1
-                continue
-            try:
-                idx_rec, complete = export_session(client, summary, out_dir, i, args, account_label)
-            except ApiError as err:
-                eprint("    FAILED: %s" % err)
-                incomplete.append((summary.get("id"), title, str(err)))
-                index_fh.write(json.dumps({
-                    "record_type": "session_failed",
-                    "session_id": summary.get("id"),
-                    "title": title,
-                    "account": account_label,
-                    "error": str(err),
-                }, ensure_ascii=False) + "\n")
-                index_fh.flush()
-                continue
-            index_fh.write(json.dumps(idx_rec, ensure_ascii=False) + "\n")
-            index_fh.flush()
-            if merged_fh is not None:
-                session_file = out_dir / idx_rec["file"]
-                with session_file.open("r", encoding="utf-8") as sf:
-                    for line in sf:
-                        merged_fh.write(line)
-                merged_fh.flush()
-            status = "complete" if complete else "INCOMPLETE (missing message payloads — rerun later)"
-            eprint("    -> %s  [%s, %d events]" % (idx_rec["file"], status, idx_rec["event_count"]))
-            if not complete:
-                incomplete.append((summary.get("id"), title, "missing message payloads"))
             else:
-                ok_count += 1
-            if args.delay > 0 and i < len(summaries):
-                time.sleep(args.delay)
+                todo.append((i, summary))
+
+        if args.workers > 1:
+            # Concurrent fetching; results are absorbed in deterministic
+            # summary order, so index.jsonl/merged stay identical to a serial
+            # run. The inter-session --delay pause is disabled in this mode.
+            with ThreadPoolExecutor(max_workers=args.workers) as ex:
+                futures = [(i, s, ex.submit(export_session, client, s, out_dir, i,
+                                            args, account_label, None))
+                           for i, s in todo]
+                for i, summary, fut in futures:
+                    title = (summary.get("title") or "Untitled")[:50]
+                    eprint("[%d/%d] %s ..." % (i, len(summaries), title))
+                    try:
+                        idx_rec = fut.result()
+                    except ApiError as err:
+                        record_failure(summary, err)
+                        continue
+                    absorb(idx_rec)
+        else:
+            for i, summary in todo:
+                title = (summary.get("title") or "Untitled")[:50]
+                eprint("[%d/%d] %s ..." % (i, len(summaries), title))
+                try:
+                    idx_rec = export_session(client, summary, out_dir, i, args,
+                                             account_label, merged_fh=merged_fh)
+                except ApiError as err:
+                    record_failure(summary, err)
+                    continue
+                absorb(idx_rec)
+                if args.delay > 0 and i < len(summaries):
+                    time.sleep(args.delay)
     except KeyboardInterrupt:
         eprint("\nInterrupted — partial index.jsonl kept.")
         rc = 130
-    else:
-        rc = 0
     finally:
         index_fh.close()
         if merged_fh is not None:
             merged_fh.close()
 
+    elapsed = round(time.time() - started, 1)
     eprint("")
     eprint("Done: %d/%d session(s) exported cleanly -> %s" % (ok_count, len(summaries), out_dir))
-    if merged_fh is not None and not args.no_merged:
+    if merged_fh is not None and merged_enabled:
         eprint("Merged stream: %s" % merged_path)
     eprint("Index: %s" % index_path)
     if incomplete:
         eprint("Attention: %d session(s) had problems:" % len(incomplete))
         for sid, title, why in incomplete:
             eprint("  - %s (%s): %s" % (sid, title[:40], why))
+    _write_summary_file(out_dir, {
+        "tool": "zai-session-exporter", "version": __version__,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "elapsed_seconds": elapsed,
+        "account": account_label, "base_url": args.base_url,
+        "format": args.format, "events": args.events_tag, "workers": args.workers,
+        "requested": len(summaries), "exported_ok": ok_count,
+        "incomplete": [{"session_id": s, "title": t, "problem": w} for s, t, w in incomplete],
+        "unavailable": unavailable,
+        "output_dir": str(out_dir),
+        "merged": merged_enabled and not args.no_merged,
+    })
     if rc == 0 and (incomplete or unavailable):
         rc = 1  # partial success counts as failure for scripts (see README: Exit codes)
     return rc
