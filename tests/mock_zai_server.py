@@ -107,6 +107,16 @@ def build_fixture():
         "messages": b_msgs,
     }
 
+    # -- session C: detail advertises a message id the store cannot return --
+    c_id = "cccc3333-4444-5555-6666-777788889999"
+    sessions[c_id] = {
+        "id": c_id, "title": "Broken session — payload missing", "type": "default",
+        "created_at": 1763900000, "updated_at": 1763900010,
+        "pinned": False, "folder_id": None,
+        "messages": {},                 # batch store has nothing ...
+        "advertised_ids": ["x1"],       # ... but the detail map still lists x1
+    }
+
     return sessions
 
 SESSIONS = build_fixture()
@@ -145,7 +155,7 @@ class Handler(BaseHTTPRequestHandler):
                 "id": s["id"], "title": s["title"], "type": s["type"],
                 "created_at": s["created_at"], "updated_at": s["updated_at"],
                 "chat": {"id": s["id"],
-                         "history": {"messages": {mid: {"id": mid} for mid in s["messages"]}}},
+                         "history": {"messages": {mid: {"id": mid} for mid in s.get("advertised_ids", s["messages"])}}},
             })
         if self.path.startswith("/api/v1/chats/"):
             page = 1

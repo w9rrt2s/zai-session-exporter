@@ -11,7 +11,7 @@ precise JSONL files, capturing literally every action in each session:
   * the model's final replies
   * every tool call and tool result (verbatim arguments and payloads)
   * token usage, model names, timestamps, branch (parent/child) structure
-  * `raw_original` on every line: the untouched API message object, byte-faithful
+  * `raw_original` on every line: the verbatim API message (parsed JSON, key order preserved)
 
 Output layout (both organizations at once):
   <output>/sessions/NNN_<title>_<id>.jsonl   one file per session
@@ -45,7 +45,7 @@ except ImportError:  # pragma: no cover
     sys.stderr.write("Python 3 with urllib is required.\n")
     raise
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 DEFAULT_BASE_URL = "https://chat.z.ai"
 SCHEMA_VERSION = 1
 
@@ -182,7 +182,10 @@ class ZaiClient:
             missing = chunk_set - returned
             if missing:
                 complete = False
-                problems.append("batch %d missing ids: %s" % (ci, ", ".join(sorted(missing)[:10])))
+                shown = sorted(missing)[:10]
+                extra = len(missing) - len(shown)
+                problems.append("batch %d missing ids: %s%s" % (ci, ", ".join(shown),
+                                                                " (+%d more)" % extra if extra else ""))
         return messages, complete, problems
 
 
@@ -234,7 +237,13 @@ def list_all_chats(client, chat_type, quiet=False):
     while True:
         data = client.list_chats_page(page, chat_type)
         if isinstance(data, dict):  # tolerate {"chats": [...]} wrappers
-            data = data.get("chats") or data.get("items") or data.get("data") or []
+            for key in ("chats", "items", "data"):
+                if key in data:
+                    data = data[key]
+                    break
+            else:
+                raise ApiError("Unknown chat-list payload shape on page %d (top-level keys: %s)"
+                               % (page, ", ".join(sorted(data.keys())) or "none"))
         if not isinstance(data, list):
             raise ApiError("Unexpected chat-list payload on page %d: %s" % (page, type(data).__name__))
         if not data:
@@ -278,9 +287,6 @@ THINKING_TYPES = {"reasoning", "thinking", "thought", "reflection", "plan"}
 MEDIA_TYPES = {"image", "image_url", "file", "audio", "video"}
 META_TYPES = {"system", "error", "metadata"}
 
-# Block types that are NOT plain answer text (anything unlisted is treated as text).
-NON_TEXT_TYPES = THINKING_TYPES | TOOL_CALL_TYPES | TOOL_RESULT_TYPES | MEDIA_TYPES | META_TYPES
-
 
 def block_text(block):
     """Read a content block's textual payload, tolerating several field shapes."""
@@ -308,6 +314,11 @@ def block_text(block):
                     if isinstance(v.get(sub_key), str):
                         return v[sub_key]
     return ""
+
+
+def _norm_text(s):
+    """Whitespace-normalized text, used only for duplicate detection."""
+    return " ".join((s or "").split())
 
 
 def iso_or_none(value):
@@ -373,7 +384,7 @@ def extract_events(msg, message_seq):
             "tool": tool,
             "files": files_ev,
             "raw_block": raw_block,
-            "raw_original": msg,   # verbatim, byte-faithful full message
+            "raw_original": msg,   # verbatim full message (parsed JSON)
         })
         events.append(ev)
 
@@ -401,7 +412,7 @@ def extract_events(msg, message_seq):
 
     # --- 3. content_blocks: thinking / tool calls / tool results / text --
     if blocks is not None:
-        seen_reasoning = ""
+        seen_reasoning_parts = []
         seen_texts = []
         for block in blocks:
             if not isinstance(block, dict):
@@ -411,7 +422,7 @@ def extract_events(msg, message_seq):
             btype = str(block.get("type") or "").lower()
 
             if btype in THINKING_TYPES:
-                seen_reasoning += block_text(block)
+                seen_reasoning_parts.append(_norm_text(block_text(block)))
                 emit("thinking", block_text(block), raw_block=block)
             elif btype in TOOL_CALL_TYPES:
                 fn = block.get("function") if isinstance(block.get("function"), dict) else {}
@@ -432,7 +443,8 @@ def extract_events(msg, message_seq):
                      tool={
                          "id": block.get("tool_call_id") or block.get("id"),
                          "name": block.get("name") or block.get("tool_name"),
-                         "status": block.get("status") or block.get("is_error") and "error",
+                         "status": block.get("status") if block.get("status") is not None
+                                   else ("error" if block.get("is_error") else None),
                          "type": block.get("type"),
                      },
                      raw_block=block)
@@ -450,14 +462,16 @@ def extract_events(msg, message_seq):
 
         # Top-level `reasoning` string that content_blocks didn't already cover.
         top_reasoning = msg.get("reasoning") or msg.get("reasoning_content")
-        if isinstance(top_reasoning, str) and top_reasoning.strip() and top_reasoning.strip() not in seen_reasoning:
+        if isinstance(top_reasoning, str) and top_reasoning.strip() \
+                and _norm_text(top_reasoning) not in seen_reasoning_parts:
             emit("thinking", top_reasoning, raw_block=None)
 
         # A plain string `content` alongside content_blocks. Emitted only when
         # it is NOT already covered by an answer-text block above (dedup), so
         # nothing appears twice — everything stays available in raw_original.
         content = msg.get("content")
-        if isinstance(content, str) and content.strip() and content.strip() not in seen_texts:
+        if isinstance(content, str) and content.strip() \
+                and _norm_text(content) not in (_norm_text(t) for t in seen_texts):
             emit("model_reply" if role == "assistant" else ("user_input" if role == "user" else "other"),
                  content)
         elif isinstance(content, list):
@@ -553,6 +567,8 @@ def readable_order(messages_by_id):
             parent_of[mid] = str(pid)
             children_of.setdefault(str(pid), []).append(mid)
 
+    pos_of = {mid: i for i, mid in enumerate(ids)}  # O(1) lookup (ids.index() was O(n^2) overall)
+
     def sort_key(mid):
         m = messages_by_id.get(mid) or {}
         ts = m.get("timestamp") if isinstance(m, dict) else None
@@ -560,7 +576,7 @@ def readable_order(messages_by_id):
             t = float(ts) if ts is not None else float("inf")
         except (TypeError, ValueError):
             t = float("inf")
-        return (t, ids.index(mid))
+        return (t, pos_of[mid])
 
     for kids in children_of.values():
         kids.sort(key=sort_key)
@@ -607,11 +623,18 @@ def export_session(client, summary, out_dir, ordinal, args, account_label):
                 eprint("    messages batch %d/%d" % (ci, n))
         messages_map, complete, problems = client.fetch_messages_batch(
             chat_id, ids, batch_size=args.batch_size, progress_cb=batch_progress)
+    else:
+        complete = False
+        problems.append("no message ids found in session detail (history map missing or empty)")
 
     order, _roots = readable_order(messages_map)
     # Display order = readable tree order; keep canonical seq as message_seq anchor.
     canon_pos = {mid: i + 1 for i, mid in enumerate(ids)}
-    display_ids = [mid for mid in order] or ids
+    # Ids the server never returned are appended (canonical order) as
+    # missing_message events, so nothing silently disappears from the export.
+    ordered_present = [mid for mid in order]
+    missing_ids = [mid for mid in ids if mid not in messages_map]
+    display_ids = (ordered_present or [mid for mid in ids if mid in messages_map]) + missing_ids
 
     # ---- build lines -------------------------------------------------------
     lines = []
@@ -641,7 +664,17 @@ def export_session(client, summary, out_dir, ordinal, args, account_label):
     event_seq = 0
     for display_i, mid in enumerate(display_ids, 1):
         msg = messages_map.get(mid)
-        evs = extract_events(msg, canon_pos.get(mid))
+        if msg is None:
+            evs = [{
+                "event": "missing_message", "role": None, "text": None,
+                "message_seq": canon_pos.get(mid), "message_id": mid,
+                "parent_id": None, "children_ids": None,
+                "timestamp": None, "timestamp_epoch": None,
+                "model": None, "usage": None, "files": None, "tool": None,
+                "raw_block": None, "raw_original": None,
+            }]
+        else:
+            evs = extract_events(msg, canon_pos.get(mid))
         for ev in evs:
             event_seq += 1
             ev = {
@@ -694,6 +727,15 @@ def export_session(client, summary, out_dir, ordinal, args, account_label):
 # Main
 # ---------------------------------------------------------------------------
 
+def _valid_date(s):
+    """argparse type: reject values that are not YYYY-MM-DD calendar dates."""
+    try:
+        datetime.strptime(s, "%Y-%m-%d")
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected YYYY-MM-DD, got %r" % s)
+    return s
+
+
 def parse_args(argv):
     p = argparse.ArgumentParser(
         prog="zai_exporter",
@@ -708,10 +750,14 @@ def parse_args(argv):
     p.add_argument("--base-url", default=DEFAULT_BASE_URL, help="API base (default: %s)." % DEFAULT_BASE_URL)
     p.add_argument("--chat-type", default="default", help="Chat list type filter (default: 'default'; try 'all').")
     p.add_argument("--last", type=int, default=None, metavar="N", help="Only the N most recent sessions.")
-    p.add_argument("--from", dest="from_date", default=None, metavar="YYYY-MM-DD", help="Sessions updated on/after this date (UTC).")
-    p.add_argument("--to", dest="to_date", default=None, metavar="YYYY-MM-DD", help="Sessions updated on/before this date (UTC).")
+    p.add_argument("--from", dest="from_date", default=None, metavar="YYYY-MM-DD", type=_valid_date,
+                   help="Sessions updated on/after this date (UTC).")
+    p.add_argument("--to", dest="to_date", default=None, metavar="YYYY-MM-DD", type=_valid_date,
+                   help="Sessions updated on/before this date (UTC).")
     p.add_argument("--session", action="append", default=[], metavar="ID", help="Export only these session ids (repeatable).")
-    p.add_argument("--list", action="store_true", help="List sessions only; do not export.")
+    p.add_argument("--list", action="store_true", help="List sessions to stdout only; do not export.")
+    p.add_argument("--resume", action="store_true",
+                   help="Skip sessions already exported cleanly with unchanged updated_at (reads previous index.jsonl).")
     p.add_argument("--batch-size", type=int, default=50, help="Message ids per batch POST (default: 50).")
     p.add_argument("--retries", type=int, default=3, help="HTTP retries per request (default: 3).")
     p.add_argument("--delay", type=float, default=0.4, help="Pause between sessions in seconds (default: 0.4).")
@@ -733,6 +779,9 @@ def main(argv=None):
     eprint("zai-session-exporter v%s" % __version__)
     try:
         if args.guest:
+            if args.token or os.environ.get("ZAI_TOKEN", "").strip() or Path(args.token_file).is_file():
+                eprint("NOTE: --guest combined with a token / ZAI_TOKEN / token.txt — "
+                       "--guest wins: a brand-new empty guest identity will be used.")
             ident = client.create_guest_session()
             if not isinstance(ident, dict) or not ident.get("token"):
                 raise ApiError("Guest provisioning failed.")
@@ -750,27 +799,50 @@ def main(argv=None):
         return 2
     eprint("Identity: %s [%s]" % (account_label, source_desc))
 
-    # ---- list sessions -----------------------------------------------------
-    eprint("Listing sessions (chat type: %s) ..." % args.chat_type)
+    # ---- list / resolve sessions -------------------------------------------
+    summaries, unavailable = [], []
     try:
-        summaries = list_all_chats(client, args.chat_type, quiet=args.quiet)
+        direct = bool(args.session) and not (args.from_date or args.to_date or args.last is not None)
+        if direct:
+            # Requested ids are fetched straight away — no full listing needed.
+            eprint("Fetching %d requested session(s) directly ..." % len(args.session))
+            seen = set()
+            for sid in args.session:
+                sid = str(sid)
+                if sid in seen:
+                    continue
+                seen.add(sid)
+                try:
+                    d = client.get_chat_details(sid)
+                except ApiError as err:
+                    eprint("WARNING: session %s unavailable: %s" % (sid, err))
+                    unavailable.append(sid)
+                    continue
+                summaries.append({"id": d.get("id") or sid,
+                                  "title": d.get("title") or "Untitled",
+                                  "created_at": d.get("created_at"),
+                                  "updated_at": d.get("updated_at")})
+        else:
+            eprint("Listing sessions (chat type: %s) ..." % args.chat_type)
+            summaries = list_all_chats(client, args.chat_type, quiet=args.quiet)
+            if args.session:
+                wanted = set(args.session)
+                summaries = [c for c in summaries if str(c.get("id")) in wanted]
+                missing = wanted - {str(c.get("id")) for c in summaries}
+                for mid in sorted(missing):
+                    eprint("WARNING: session id %s not found in your list" % mid)
+                unavailable.extend(sorted(missing))
+            summaries = apply_scope(summaries, args)
     except ApiError as err:
         eprint("ERROR: could not list sessions: %s" % err)
         return 2
-    if args.session:
-        wanted = set(args.session)
-        summaries = [c for c in summaries if str(c.get("id")) in wanted]
-        missing = wanted - {str(c.get("id")) for c in summaries}
-        for mid in sorted(missing):
-            eprint("WARNING: session id %s not found in your list" % mid)
-    summaries = apply_scope(summaries, args)
 
     eprint("Found %d session(s) in scope." % len(summaries))
     if args.list:
         for i, c in enumerate(summaries, 1):
-            eprint("  %3d. [%s] %s  (id=%s, updated=%s, %d msg(s))"
-                   % (i, c.get("type", "?"), (c.get("title") or "Untitled")[:60],
-                      c.get("id"), iso_ts(c.get("updated_at")) or "?", c.get("message_count", "?")))
+            print("  %3d. [%s] %s  (id=%s, updated=%s, %s msg(s))"
+                  % (i, c.get("type", "?"), (c.get("title") or "Untitled")[:60],
+                     c.get("id"), iso_ts(c.get("updated_at")) or "?", c.get("message_count", "?")))
         return 0
     if not summaries:
         eprint("Nothing to export. If this surprises you, read the token note above — "
@@ -783,6 +855,19 @@ def main(argv=None):
     index_path = out_dir / "index.jsonl"
     merged_path = out_dir / "merged_all.jsonl"
 
+    # --resume: remember cleanly exported sessions from a previous run.
+    prev_index = {}
+    if args.resume and index_path.is_file():
+        with index_path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict) and rec.get("record_type") == "session_index" \
+                        and rec.get("export_complete") and rec.get("file"):
+                    prev_index[str(rec.get("session_id"))] = rec
+
     index_fh = index_path.open("w", encoding="utf-8")
     merged_fh = None if args.no_merged else merged_path.open("w", encoding="utf-8")
 
@@ -791,11 +876,32 @@ def main(argv=None):
         for i, summary in enumerate(summaries, 1):
             title = (summary.get("title") or "Untitled")[:50]
             eprint("[%d/%d] %s ..." % (i, len(summaries), title))
+            prev = prev_index.get(str(summary.get("id")))
+            if prev and (out_dir / prev["file"]).is_file() and \
+                    prev.get("updated_at") == iso_or_none(summary.get("updated_at")):
+                eprint("    unchanged since last export — skipped (--resume)")
+                index_fh.write(json.dumps(prev, ensure_ascii=False) + "\n")
+                index_fh.flush()
+                if merged_fh is not None:
+                    with (out_dir / prev["file"]).open("r", encoding="utf-8") as sf:
+                        for line in sf:
+                            merged_fh.write(line)
+                    merged_fh.flush()
+                ok_count += 1
+                continue
             try:
                 idx_rec, complete = export_session(client, summary, out_dir, i, args, account_label)
             except ApiError as err:
                 eprint("    FAILED: %s" % err)
                 incomplete.append((summary.get("id"), title, str(err)))
+                index_fh.write(json.dumps({
+                    "record_type": "session_failed",
+                    "session_id": summary.get("id"),
+                    "title": title,
+                    "account": account_label,
+                    "error": str(err),
+                }, ensure_ascii=False) + "\n")
+                index_fh.flush()
                 continue
             index_fh.write(json.dumps(idx_rec, ensure_ascii=False) + "\n")
             index_fh.flush()
@@ -832,6 +938,8 @@ def main(argv=None):
         eprint("Attention: %d session(s) had problems:" % len(incomplete))
         for sid, title, why in incomplete:
             eprint("  - %s (%s): %s" % (sid, title[:40], why))
+    if rc == 0 and (incomplete or unavailable):
+        rc = 1  # partial success counts as failure for scripts (see README: Exit codes)
     return rc
 
 
