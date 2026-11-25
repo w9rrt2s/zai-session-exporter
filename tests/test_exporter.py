@@ -311,13 +311,13 @@ def exercise():
         check(True, "unknown chat-list dict shape raises ApiError")
 
     chain = {}
-    for i in range(500):
+    for i in range(1500):
         chain["m%d" % i] = {"id": "m%d" % i, "timestamp": 1000 + i,
                             "parent_id": None if i == 0 else "m%d" % (i - 1),
-                            "children_ids": [] if i == 499 else ["m%d" % (i + 1)]}
+                            "children_ids": [] if i == 1499 else ["m%d" % (i + 1)]}
     ordered, roots = zx.readable_order(chain)
-    check(ordered == ["m%d" % i for i in range(500)] and roots == 1,
-          "readable_order handles a 500-message chain correctly (fast O(n))")
+    check(ordered == ["m%d" % i for i in range(1500)] and roots == 1,
+          "readable_order handles a 1500-message chain (iterative — no RecursionError, fast O(n))")
 
     for bad in ("2026/01/01", "2026-13-01", "not-a-date"):
         try:
