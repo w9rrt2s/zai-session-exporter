@@ -58,7 +58,7 @@ except ImportError:  # pragma: no cover
     sys.stderr.write("Python 3 with urllib is required.\n")
     raise
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 DEFAULT_BASE_URL = "https://chat.z.ai"
 SCHEMA_VERSION = 1
 
@@ -652,13 +652,20 @@ def readable_order(messages_by_id):
         kids.sort(key=sort_key)
 
     ordered, visited = [], set()
-    def walk(mid):
-        if mid in visited:
-            return
-        visited.add(mid)
-        ordered.append(mid)
-        for kid in children_of.get(mid, []):
-            walk(kid)
+    def walk(start):
+        # v1.2.1 performance/robustness fix: the recursive version crashed with
+        # RecursionError on linear chains deeper than the interpreter limit
+        # (~1000 messages — real long sessions exceed that). Explicit-stack
+        # DFS, byte-identical pre-order output.
+        stack = [start]
+        while stack:
+            mid = stack.pop()
+            if mid in visited:
+                continue
+            visited.add(mid)
+            ordered.append(mid)
+            for kid in reversed(children_of.get(mid, [])):
+                stack.append(kid)
 
     roots = [mid for mid in ids if mid not in parent_of]
     for r in sorted(roots, key=sort_key):
@@ -1229,6 +1236,11 @@ def main(argv=None):
     summaries, unavailable = [], []
     try:
         direct = bool(args.session) and not (args.from_date or args.to_date or args.last is not None)
+        if direct and getattr(args, "search", None):
+            # v1.2.1 integration fix: --search used to be silently ignored in
+            # direct mode; now we say so instead of staying quiet.
+            eprint("NOTE: --search is ignored together with --session "
+                   "(direct ids are already the precise selection).")
         if direct:
             # Requested ids are fetched straight away — no full listing needed.
             eprint("Fetching %d requested session(s) directly ..." % len(args.session))
