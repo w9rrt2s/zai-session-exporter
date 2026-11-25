@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zai-session-exporter"
+dynamic = ["version"]
+description = "Export all chat.z.ai sessions to precise, readable JSONL / Markdown / HTML — user inputs, model thinking, replies and tool calls, verbatim."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "w9rrt2s" }]
+keywords = [
+  "zai", "z-ai", "chat-exporter", "jsonl", "conversation-export",
+  "data-portability", "backup", "cli", "chatgpt-export", "glm",
+]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Environment :: Console",
+  "Intended Audience :: End Users/Desktop",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Communications :: Chat",
+  "Topic :: System :: Archiving :: Backup",
+  "Topic :: Utilities",
+]
+
+[project.scripts]
+zai-exporter = "zai_exporter:main"
+
+[project.urls]
+Homepage = "https://github.com/w9rrt2s/zai-session-exporter"
+Repository = "https://github.com/w9rrt2s/zai-session-exporter"
+Issues = "https://github.com/w9rrt2s/zai-session-exporter/issues"
+
+# The tool stays a single stdlib-only file; packaging simply exposes it.
+[tool.setuptools]
+py-modules = ["zai_exporter"]
+
+[tool.setuptools.dynamic]
+version = { attr = "zai_exporter.__version__" }
