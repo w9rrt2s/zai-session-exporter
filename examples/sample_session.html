@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Weather check — Baghdad — zai session</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--ink:#1d2330;--mut:#68718a;--line:#e3e6ee}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans",sans-serif}
+header{background:var(--card);border-bottom:1px solid var(--line);padding:18px 22px;position:sticky;top:0;z-index:2}
+h1{margin:0 0 4px;font-size:19px}
+.meta{color:var(--mut);font-size:12.5px}
+.meta b{color:var(--ink)}
+#search{margin-top:10px;width:min(560px,100%);padding:8px 12px;border:1px solid var(--line);border-radius:8px;font:inherit}
+main{max-width:900px;margin:18px auto 60px;padding:0 14px}
+.ev{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 16px;margin:10px 0}
+.ev.hidden{display:none}
+.hd{line-height:1.9}
+.tag{display:inline-block;font-size:11px;font-weight:600;letter-spacing:.4px;text-transform:uppercase;border-radius:5px;padding:2px 8px;margin-right:8px;color:#fff}
+.t-user_input{background:#2563eb}.t-model_reply{background:#059669}.t-thinking{background:#7c3aed}
+.t-tool_call{background:#0f766e}.t-tool_result{background:#334155}.t-attachment{background:#b45309}
+.t-other{background:#64748b}.t-missing_message{background:#dc2626}
+.seq{color:var(--mut);font-size:12px}
+.who{font-size:12.5px;color:var(--mut);margin-left:8px}
+.body{margin-top:8px;white-space:pre-wrap;word-wrap:break-word;overflow-wrap:anywhere}
+pre.body{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#0f172a;color:#e2e8f0;border-radius:8px;padding:10px 12px;overflow:auto;margin:8px 0 0}
+details{margin-top:8px}
+summary{cursor:pointer;color:#7c3aed;font-size:13px;font-weight:600}
+details.tool summary{color:#0f766e}
+.toolname{font-weight:600;color:#0f766e}
+.status{font-size:11px;border-radius:4px;padding:1px 6px;margin-left:6px;background:#e2e8f0;color:#334155}
+.status.error{background:#fee2e2;color:#b91c1c}
+.missing{color:#b45309;font-style:italic}
+.nopayload{color:var(--mut);font-style:italic}
+footer{max-width:900px;margin:0 auto 40px;padding:0 14px;color:var(--mut);font-size:12.5px}
+</style>
+</head>
+<body>
+<header>
+<h1>Weather check — Baghdad</h1>
+<div class="meta">Session <b>bbbb2222-3333-4444-5555-666677778888</b> · type <b>default</b> · created <b>2025-11-25T19:30:00+00:00</b> · updated <b>2025-11-25T19:46:55+00:00</b> · messages <b>3</b> · complete <b style="color:#059669">yes</b></div>
+<input id="search" type="search" placeholder="Filter events by text..." aria-label="Filter events">
+</header>
+<main id="stream">
+<div class="ev" data-t="user_input"><div class="hd"><span class="tag t-user_input">user input</span> <span class="seq">#1</span><span class="who">user · 2025-11-25T19:46:40+00:00</span></div><div class="body" dir="auto">What is the weather in Baghdad?</div></div>
+<div class="ev" data-t="tool_call"><div class="hd"><span class="tag t-tool_call">tool call</span> <span class="seq">#2</span><span class="who">assistant · glm-5.4 · 2025-11-25T19:46:50+00:00</span></div><details open class="tool"><summary><span class="toolname">get_weather</span></summary><pre class="body" dir="auto">{&quot;city&quot;: &quot;Baghdad&quot;, &quot;unit&quot;: &quot;celsius&quot;}</pre></details></div>
+<div class="ev" data-t="thinking"><div class="hd"><span class="tag t-thinking">thinking</span> <span class="seq">#2</span><span class="who">assistant · glm-5.4 · 2025-11-25T19:46:50+00:00</span></div><details open><summary>Thinking</summary><div class="body" dir="auto">Weather question -&gt; call the weather MCP tool for Baghdad, then summarize.</div></details></div>
+<div class="ev" data-t="tool_result"><div class="hd"><span class="tag t-tool_result">tool result</span> <span class="seq">#3</span><span class="who">tool · 2025-11-25T19:46:55+00:00</span></div><details open class="tool"><summary><span class="toolname">get_weather</span></summary><pre class="body" dir="auto">{&quot;temp_c&quot;: 24, &quot;condition&quot;: &quot;sunny&quot;}</pre></details></div>
+</main>
+<footer>zai-session-exporter · 4 events · thinking: 1 · tool_call: 1 · tool_result: 1 · user_input: 1</footer>
+<script>
+(function(){
+  var q=document.getElementById('search');
+  q.addEventListener('input',function(){var v=q.value.toLowerCase();
+    var list=document.querySelectorAll('.ev');
+    for(var i=0;i<list.length;i++){var el=list[i];
+      el.classList.toggle('hidden',!!v&&el.textContent.toLowerCase().indexOf(v)===-1);}
+  });
+})();
+</script>
+</body>
+</html>
