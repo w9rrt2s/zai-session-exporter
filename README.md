@@ -8,7 +8,7 @@ human-readable **JSONL** — capturing literally every action that happened:
 - the model's **final replies**
 - every **tool call** and **tool result** (verbatim arguments and payloads)
 - **token usage**, model names, timestamps, and branch (regenerated-answer) structure
-- `raw_original` on every line: the **untouched API message object**, byte-faithful
+- `raw_original` on every line: the **verbatim API message object** (parsed JSON, key order preserved)
 
 Single-file CLI, **zero dependencies** (Python 3.8+ standard library only).
 
@@ -63,17 +63,29 @@ python3 zai_exporter.py --last 10
 # date range (UTC, by last-update)
 python3 zai_exporter.py --from 2026-01-01 --to 2026-11-26
 
-# one specific session
+# one specific session (fetched directly, without listing everything first)
 python3 zai_exporter.py --session 6f8a...c90
 
-# list what would be exported, without exporting
+# list what would be exported, without exporting (prints to stdout)
 python3 zai_exporter.py --list
+
+# skip sessions already exported cleanly and unchanged since then
+python3 zai_exporter.py --resume
 
 # free automatic mode (new empty guest — see note above)
 python3 zai_exporter.py --guest
 ```
 
 All flags: `python3 zai_exporter.py --help`.
+
+## Exit codes
+
+| code | meaning |
+| --- | --- |
+| `0` | every session exported cleanly |
+| `1` | exported, but some sessions had problems (see `index.jsonl`, `session_failed` records and stderr) |
+| `2` | authentication or session listing failed |
+| `130` | interrupted with Ctrl-C (partial `index.jsonl` kept) |
 
 ## Output layout
 
@@ -82,8 +94,8 @@ my_export/
 ├── index.jsonl          # one summary line per exported session
 ├── merged_all.jsonl     # every line of every session, one stream
 └── sessions/
-    ├── 001_Weather_check_Baghdad_bbbb2222.jsonl
-    ├── 002_Sales_trend_analysis___chart_aaaa1111.jsonl
+    ├── 001_Weather_check_—_Baghdad_bbbb2222.jsonl
+    ├── 002_Sales_trend_analysis_&_chart_aaaa1111.jsonl
     └── ...
 ```
 
@@ -108,7 +120,7 @@ Every session file is three kinds of lines:
  "timestamp": "2025-11-25T19:34:05+00:00",
  "text": "The user wants a trend chart. First I must inspect the CSV…",
  "tool": null, "files": null, "raw_block": {"type": "reasoning", "content": "…"},
- "raw_original": {…entire API message, byte-faithful…}}
+ "raw_original": {…entire API message verbatim…}}
 ```
 
 Event types:
@@ -122,15 +134,18 @@ Event types:
 | `tool_call` | a tool invocation with its verbatim arguments |
 | `tool_result` | the tool's response payload |
 | `other` | system / metadata / error blocks, or messages with no recoverable payload |
-| `missing_message` | a message id the server did not return (never silently dropped) |
+| `missing_message` | a message id the server did not return — exported as its own event line, never silently dropped |
 
 Tool fields are parsed into `tool.id`, `tool.name`, `tool.arguments` — and the
 original block stays in `raw_block`, the whole message in `raw_original`.
 
 **3. `session_end` footer** — event counts + completeness flag.
 
-Nothing is reordered inside the raw data: `raw_original` is always exactly what
-the server returned, and text fields are extracted read-only.
+Nothing is reordered inside the raw data: `raw_original` keeps the server's
+exact JSON structure and key order, and text fields are extracted read-only.
+(One honest caveat: this is parsed JSON re-serialized, not raw bytes — a
+duplicated key inside one server object would collapse, and `\u00XX` escapes
+normalize to real characters.)
 
 ---
 
@@ -139,21 +154,39 @@ the server returned, and text fields are extracted read-only.
 Offline end-to-end test against a faithful mock of the chat.z.ai API:
 
 ```bash
-python3 tests/mock_zai_server.py 8399 &   # mock API (2 fixture sessions)
-python3 zai_exporter.py --token testtok --base-url http://127.0.0.1:8399 -o /tmp/zai_test_out
+python3 tests/test_exporter.py   # self-contained: starts its own mock API
 ```
 
 The fixture covers: attachments, multi-block reasoning, multiple sequential
 tool calls with results, OpenAI-style top-level `tool_calls`, `role=tool`
-result messages, `reasoning_content`, regenerated-answer branches, and token
-usage — 27 assertions verify verbatim fidelity of every exported field.
+result messages, `reasoning_content`, regenerated-answer branches, a broken
+session whose payload the server lost, and token usage — 70 checks verify
+verbatim fidelity, exit codes, `--resume`/`--session`/`--list` behavior and
+stdout/stderr routing.
 
-## Notes & limits
+## Notes, limits & known flaws (read before relying on this)
 
 - Exporting uses only read endpoints; the tool cannot modify or delete anything.
+- **The API is unofficial** (reverse-engineered). It can change at any time
+  and break the tool; unknown list/detail shapes now fail loudly instead of
+  exporting nothing silently.
+- **Attachments are metadata only** — the tool records file names/sizes but
+  does not download file contents.
+- **No import back into chat.z.ai.** Re-uploading could only recreate a lossy
+  copy (new message ids, new timestamps, no thinking blocks), so the tool
+  stays read-only by design.
+- **No incremental export by default** — every run re-fetches everything.
+  `--resume` skips sessions already exported cleanly with unchanged
+  `updated_at`; partially-broken sessions are always re-fetched.
+- **A whole session is held in memory** while messages are ordered; gigantic
+  sessions with huge embedded payloads may need a lot of RAM.
+- `raw_original` is verbatim *structure* (see the JSON caveat above), not a
+  raw byte capture.
+- Passing `--token '...'` exposes the token in your shell history and process
+  list; prefer `token.txt` or the `ZAI_TOKEN` environment variable.
 - Very large sessions are fetched in chunks of 50 message ids with retry +
-  exponential backoff; `export_complete: false` + `problems` lists anything the
-  server failed to return (rerun to retry).
+  exponential backoff; `export_complete: false` + `problems` lists anything
+  the server failed to return (rerun, or use `--resume`).
 - `--chat-type` defaults to `default` (what the web app uses); pass `all` if
   your account keeps other chat types.
 - Rate limiting: `--delay` (default 0.4 s) pauses politely between sessions.
