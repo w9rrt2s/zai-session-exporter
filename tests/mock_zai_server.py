@@ -138,6 +138,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/api/v1/auths/":
+            auth = self.headers.get("Authorization") or ""
+            if auth == "Bearer expired-token":
+                # lets tests verify the HTTP 401 -> "token expired" hint path
+                return self._json({"detail": "invalid or expired token"}, 401)
             if self._authed():
                 return self._json({"id": "user-1", "email": "tester@example.com",
                                    "name": "Tester", "role": "user", "token_type": "Bearer"})

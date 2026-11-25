@@ -327,5 +327,161 @@ def exercise():
             check(True, "invalid date %r rejected" % bad)
     check(zx._valid_date("2026-01-01") == "2026-01-01", "valid date accepted")
 
+    # ---------- 10. --format md ------------------------------------------
+    print("== format md ==")
+    OUTM = Path("/tmp/zai_test_md")
+    shutil.rmtree(OUTM, ignore_errors=True)
+    pm = run(["--token", "testtok", "-q", "--format", "md"], OUTM)
+    check(pm.returncode == 1, "md export keeps rc 1 for the broken session")
+    mds = sorted((OUTM / "sessions").glob("*.md"))
+    check(len(mds) == len(SESSIONS), "one .md file per session (%d)" % len(mds))
+    wmd = next(f for f in mds if f.stem.endswith("bbbb2222")).read_text(encoding="utf-8")
+    check("# Weather check" in wmd, "md: session title is the H1")
+    check("### [" in wmd and "user_input" in wmd and "tool_call" in wmd and "tool_result" in wmd,
+          "md: ordered event headings with types")
+    check("get_weather" in wmd and "```" in wmd, "md: tool name + fenced verbatim payload")
+    smd = next(f for f in mds if f.stem.endswith("aaaa1111")).read_text(encoding="utf-8")
+    check("> The user wants a trend chart" in smd, "md: thinking rendered as blockquote")
+    check("Export complete: yes" in wmd and "Export complete: NO" in
+          next(f for f in mds if f.stem.endswith("cccc3333")).read_text(encoding="utf-8"),
+          "md: completeness stated per session")
+    idxm = [r for r in read_lines(OUTM / "index.jsonl") if r.get("record_type") == "session_index"]
+    check(all(r.get("format") == "md" for r in idxm), "md: index records tagged format=md")
+    check(not (OUTM / "merged_all.jsonl").exists(),
+          "md: merged_all.jsonl deliberately not produced")
+    check("produced only with --format jsonl" in pm.stderr, "md: merge policy note printed")
+    summ = json.loads((OUTM / "export_summary.json").read_text(encoding="utf-8"))
+    check(summ.get("format") == "md" and summ.get("requested") == len(SESSIONS)
+          and summ.get("exported_ok") == len(SESSIONS) - 1 and summ.get("incomplete"),
+          "md: export_summary.json machine-readable and accurate")
+
+    # ---------- 11. --format html -----------------------------------------
+    print("== format html ==")
+    OUTH = Path("/tmp/zai_test_html")
+    shutil.rmtree(OUTH, ignore_errors=True)
+    ph = run(["--token", "testtok", "-q", "--format", "html"], OUTH)
+    check(ph.returncode == 1, "html export keeps rc 1 for the broken session")
+    hts = sorted((OUTH / "sessions").glob("*.html"))
+    check(len(hts) == len(SESSIONS), "one .html viewer per session (%d)" % len(hts))
+    wht = next(f for f in hts if f.stem.endswith("bbbb2222")).read_text(encoding="utf-8")
+    check(wht.lstrip().lower().startswith("<!doctype html>"), "html: starts with doctype")
+    check('dir="auto"' in wht, "html: RTL-safe auto direction on text bodies")
+    check("get_weather" in wht and "Filter events" in wht and "</html>" in wht,
+          "html: tool label, live filter, complete document")
+    check("__TITLE__" not in wht and "__CARDS__" not in wht and "__META__" not in wht
+          and "__FOOTER__" not in wht, "html: no unresolved template placeholders")
+    check(wht.count("class=\"ev") == 4, "html: weather session renders 4 event cards")
+    check(len(wht.encode("utf-8")) > 2000, "html: viewer is a substantial self-contained file")
+    # every user-controlled string must be escaped: raw fixture text with <> would break it
+    check("<script>" in wht and wht.count("<script>") == 1, "html: exactly one script block")
+
+    # ---------- 12. --events filter ---------------------------------------
+    print("== --events filter ==")
+    OUTE = Path("/tmp/zai_test_events")
+    shutil.rmtree(OUTE, ignore_errors=True)
+    pe = run(["--token", "testtok", "-q", "--events", "model_reply,user_input"], OUTE)
+    check(pe.returncode == 1, "events filter keeps rc 1 (broken session still probed)")
+    wef = next(f for f in (OUTE / "sessions").glob("*.jsonl") if f.stem.endswith("bbbb2222"))
+    elines = read_lines(wef)
+    evs = [l for l in elines if l.get("record_type") == "event"]
+    check(all(l.get("event") in ("model_reply", "user_input") for l in evs),
+          "events filter: only requested event types in file")
+    check(evs and evs[0]["event_seq"] == 1 and [l["event_seq"] for l in evs] == list(range(1, len(evs) + 1)),
+          "events filter: event_seq stays contiguous")
+    idxe = [r for r in read_lines(OUTE / "index.jsonl") if r.get("record_type") == "session_index"]
+    check(all(r.get("events") == "model_reply,user_input" for r in idxe),
+          "events filter: index records carry the filter tag")
+    check(all(r["event_count"] == sum(r["event_counts"].values()) for r in idxe),
+          "events filter: counts consistent after filtering")
+
+    print("== --events validation ==")
+    pbad = run(["--token", "testtok", "--events", "nope"], Path("/tmp/zai_test_badev"))
+    check(pbad.returncode == 2, "unknown --events value rejected with rc 2")
+    check("valid types" in pbad.stderr, "--events error lists the valid types")
+
+    # ---------- 13. --search ------------------------------------------------
+    print("== --search ==")
+    OUTS = Path("/tmp/zai_test_search")
+    shutil.rmtree(OUTS, ignore_errors=True)
+    ps = run(["--token", "testtok", "-q", "--search", "weather"], OUTS)
+    check(ps.returncode == 0, "--search narrows scope to healthy session only (rc 0)")
+    check(len(list((OUTS / "sessions").glob("*.jsonl"))) == 1
+          and "bbbb2222" in next(iter((OUTS / "sessions").glob("*.jsonl"))).name,
+          "--search exported exactly the matching session")
+
+    # ---------- 14. --workers (concurrent fetch) ----------------------------
+    print("== --workers 2 ==")
+    OUTW = Path("/tmp/zai_test_workers")
+    shutil.rmtree(OUTW, ignore_errors=True)
+    pw = run(["--token", "testtok", "-q", "--workers", "2"], OUTW)
+    check(pw.returncode == 1, "workers=2 keeps exit-code semantics (rc 1)")
+    check(len(list((OUTW / "sessions").glob("*.jsonl"))) == len(SESSIONS),
+          "workers=2 produced all session files")
+    idxw = [r for r in read_lines(OUTW / "index.jsonl") if r.get("record_type") == "session_index"]
+    check([r["session_id"] for r in idxw] == [r["session_id"] for r in idx_recs],
+          "workers=2: index order matches serial order (deterministic)")
+    mw = (OUTW / "merged_all.jsonl").read_text(encoding="utf-8").splitlines()
+    concatw = []
+    for sf in sorted((OUTW / "sessions").glob("*.jsonl")):
+        concatw.extend(sf.read_text(encoding="utf-8").splitlines())
+    check(mw == concatw, "workers=2: merged_all.jsonl still a full concatenation")
+    check(json.loads((OUTW / "export_summary.json").read_text(encoding="utf-8")).get("workers") == 2,
+          "workers=2: summary records worker count")
+
+    # ---------- 15. --resume respects format/event-filter changes -----------
+    print("== resume format guard ==")
+    pr = run(["--token", "testtok", "-q", "--format", "md", "--resume"], OUT)
+    check(pr.stderr.count("skipped (--resume)") == 0,
+          "resume with a different --format re-exports everything (no false skips)")
+    check(len(list((OUT / "sessions").glob("*.md"))) == len(SESSIONS),
+          "resume+md produced the md files")
+
+    # ---------- 16. expired token hint ---------------------------------------
+    print("== 401 hint ==")
+    OUTX = Path("/tmp/zai_test_expired")
+    shutil.rmtree(OUTX, ignore_errors=True)
+    px = run(["--token", "expired-token", "-q"], OUTX)
+    check(px.returncode == 2, "expired token exits rc 2")
+    check("401" in px.stderr and "expired" in px.stderr,
+          "401 produces a dedicated expired-token hint")
+
+    # ---------- 17. --list phantom column removed ----------------------------
+    print("== --list column fix ==")
+    p5b = run(["--token", "testtok", "--list"], Path("/tmp/zai_test_list2"))
+    check("? msg(s)" not in p5b.stdout, "--list no longer prints a fake message-count column")
+    check("Weather check" in p5b.stdout, "--list still lists titles")
+
+    # ---------- 18. unit: dump_line splice equivalence -----------------------
+    print("== unit: line splicing ==")
+    prefix = {"record_type": "event", "a": 1, "raw_original": {"x": 1}, "b": "two"}
+    rj = json.dumps({"x": 1}, ensure_ascii=False)
+    line = zx.dump_line(prefix, rj)
+    parsed = json.loads(line)
+    check(parsed == {"record_type": "event", "a": 1, "raw_original": {"x": 1}, "b": "two"},
+          "dump_line spliced output is semantically identical")
+    check(list(parsed.keys()) == ["record_type", "a", "b", "raw_original"],
+          "dump_line moves raw_original to the end, preserving the other keys' order")
+    check(json.loads(zx.dump_line(prefix, None)) == parsed,
+          "dump_line plain path matches spliced path")
+
+    # ---------- 19. unit: root count on a branched tree ----------------------
+    branched = {"a": {"id": "a", "parent_id": None},
+                "b": {"id": "b", "parent_id": "a"},
+                "c": {"id": "c", "parent_id": "a"}}
+    ordered_b, roots_b = zx.readable_order(branched)
+    check(ordered_b == ["a", "b", "c"] and roots_b == 1,
+          "readable_order root count correct on a branched tree (1 root, was 2)")
+
+    # ---------- 20. unit: duplicate listing ids de-duplicated -----------------
+    class DupClient:
+        def __init__(self):
+            self.calls = 0
+        def list_chats_page(self, page, chat_type):
+            self.calls += 1
+            item = {"id": "dup-1", "title": "dup", "type": "default"}
+            return [item, dict(item)] if page == 1 else []
+    dupes = zx.list_all_chats(DupClient(), "default", quiet=True)
+    check(len(dupes) == 1, "duplicate session ids in listing are de-duplicated")
+
 if __name__ == "__main__":
     sys.exit(main())
